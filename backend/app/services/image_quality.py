@@ -3,12 +3,19 @@ Image Quality Assessment Service.
 
 Evaluates image sharpness via Laplacian edge variance and verifies
 lighting conditions via mean luminance before invoking model inference.
+Supports both OpenCV and a pure NumPy fallback.
 """
 
 import io
-import cv2
 import numpy as np
 from PIL import Image
+
+try:
+    import cv2
+    HAS_OPENCV = True
+except ImportError:
+    cv2 = None
+    HAS_OPENCV = False
 
 from app.config import settings
 from app.core.exceptions import (
@@ -24,7 +31,7 @@ class ImageQualityService:
 
     def assess_quality(self, processed: ProcessedImage) -> QualityAssessment:
         """
-        Evaluate image sharpness, brightness, and dimensions.
+        Evaluate image dimensions, lighting, and sharpness.
 
         Args:
             processed: The normalized ProcessedImage output.
@@ -45,20 +52,11 @@ class ImageQualityService:
                 f"minimum requirements ({settings.IMAGE_MIN_WIDTH}x{settings.IMAGE_MIN_HEIGHT})."
             )
 
-        # 2. Decode raw normalized bytes into OpenCV grayscale array
-        cv_gray = self._to_opencv_grayscale(processed.data)
+        # 2. Decode raw normalized bytes into grayscale array
+        gray_image = self._to_grayscale_array(processed.data)
 
-        # 3. Blur calculation (Laplacian variance)
-        blur_score = self._calculate_blur_score(cv_gray)
-        blur_passed = blur_score >= settings.BLUR_THRESHOLD
-        if not blur_passed:
-            rejection_reasons.append(
-                f"Image is too blurry (sharpness score {blur_score:.1f} is below "
-                f"minimum threshold {settings.BLUR_THRESHOLD:.1f})."
-            )
-
-        # 4. Brightness calculation (Mean luminance)
-        brightness_score = self._calculate_brightness_score(cv_gray)
+        # 3. Brightness calculation (Evaluated before blur)
+        brightness_score = self._calculate_brightness_score(gray_image)
         brightness_passed = brightness_score >= settings.BRIGHTNESS_MIN_THRESHOLD
         if not brightness_passed:
             rejection_reasons.append(
@@ -66,7 +64,16 @@ class ImageQualityService:
                 f"minimum threshold {settings.BRIGHTNESS_MIN_THRESHOLD:.1f})."
             )
 
-        is_acceptable = dimensions_passed and blur_passed and brightness_passed
+        # 4. Blur calculation (Laplacian variance)
+        blur_score = self._calculate_blur_score(gray_image)
+        blur_passed = blur_score >= settings.BLUR_THRESHOLD
+        if not blur_passed:
+            rejection_reasons.append(
+                f"Image is too blurry (sharpness score {blur_score:.1f} is below "
+                f"minimum threshold {settings.BLUR_THRESHOLD:.1f})."
+            )
+
+        is_acceptable = dimensions_passed and brightness_passed and blur_passed
 
         return QualityAssessment(
             is_acceptable=is_acceptable,
@@ -81,11 +88,7 @@ class ImageQualityService:
     def validate_or_raise(self, processed: ProcessedImage) -> QualityAssessment:
         """
         Evaluate quality and raise typed domain exceptions on failure.
-
-        Raises:
-            ImageDimensionsTooSmallError: If resolution is insufficient.
-            ImageTooBlurryError: If Laplacian variance is below threshold.
-            ImageTooDarkError: If mean luminance is below threshold.
+        Enforces hierarchical inspection order: Dimensions -> Brightness -> Blur.
         """
         if not settings.IMAGE_QUALITY_CHECK_ENABLED:
             return QualityAssessment(
@@ -102,47 +105,69 @@ class ImageQualityService:
         if assessment.is_acceptable:
             return assessment
 
-        # Raise the specific failure for proper client feedback
+        # 1. Gate: Dimension insufficiency
         if not assessment.dimensions_passed:
+            reason = next((r for r in assessment.rejection_reasons if "dimensions" in r), assessment.rejection_reasons[0])
             raise ImageDimensionsTooSmallError(
-                message=assessment.rejection_reasons[0],
+                message=reason,
                 client_message="Image resolution is too low. Please move closer or check camera settings.",
             )
-        if not assessment.blur_passed:
-            raise ImageTooBlurryError(
-                message=assessment.rejection_reasons[0],
-                client_message="The photo is too blurry to inspect. Please hold your phone steady and retake.",
-            )
+
+        # 2. Gate: Scene darkness (Checked before blur because darkness causes zero gradients)
         if not assessment.brightness_passed:
+            reason = next((r for r in assessment.rejection_reasons if "dark" in r), assessment.rejection_reasons[0])
             raise ImageTooDarkError(
-                message=assessment.rejection_reasons[0],
+                message=reason,
                 client_message="The photo is too dark. Please enable flash or move to a better-lit area.",
+            )
+
+        # 3. Gate: Optical blur
+        if not assessment.blur_passed:
+            reason = next((r for r in assessment.rejection_reasons if "blurry" in r), assessment.rejection_reasons[0])
+            raise ImageTooBlurryError(
+                message=reason,
+                client_message="The photo is too blurry to inspect. Please hold your phone steady and retake.",
             )
 
         return assessment
 
-    def _to_opencv_grayscale(self, image_bytes: bytes) -> np.ndarray:
+    def _to_grayscale_array(self, image_bytes: bytes) -> np.ndarray:
         """Convert binary image data into a single-channel 8-bit grayscale numpy array."""
-        np_buffer = np.frombuffer(image_bytes, dtype=np.uint8)
-        decoded = cv2.imdecode(np_buffer, cv2.IMREAD_GRAYSCALE)
-        if decoded is None:
-            # Fallback using Pillow if OpenCV decode fails on platform-specific encodings
-            with Image.open(io.BytesIO(image_bytes)) as pil_img:
-                return np.array(pil_img.convert("L"))
-        return decoded
+        if HAS_OPENCV:
+            np_buffer = np.frombuffer(image_bytes, dtype=np.uint8)
+            decoded = cv2.imdecode(np_buffer, cv2.IMREAD_GRAYSCALE)
+            if decoded is not None:
+                return decoded
+
+        # Pillow fallback
+        with Image.open(io.BytesIO(image_bytes)) as pil_img:
+            return np.array(pil_img.convert("L"), dtype=np.float64)
 
     def _calculate_blur_score(self, gray_image: np.ndarray) -> float:
         """
         Calculate focus sharpness via the variance of the 2D Laplacian operator.
-        Sharp images with distinct edges yield higher variance.
+        Uses OpenCV when available, with a vectorized NumPy fallback.
         """
-        laplacian = cv2.Laplacian(gray_image, cv2.CV_64F)
-        return float(laplacian.var())
+        if HAS_OPENCV:
+            laplacian = cv2.Laplacian(gray_image, cv2.CV_64F)
+            return float(laplacian.var())
+
+        # Vectorized 2D discrete Laplacian via NumPy
+        if gray_image.shape[0] < 3 or gray_image.shape[1] < 3:
+            return 0.0
+
+        img = gray_image.astype(np.float64)
+        laplacian = (
+            img[:-2, 1:-1]
+            + img[2:, 1:-1]
+            + img[1:-1, :-2]
+            + img[1:-1, 2:]
+            - 4.0 * img[1:-1, 1:-1]
+        )
+        return float(np.var(laplacian))
 
     def _calculate_brightness_score(self, gray_image: np.ndarray) -> float:
-        """
-        Calculate average scene illumination as mean pixel luminance [0.0 - 255.0].
-        """
+        """Calculate average scene illumination as mean pixel luminance [0.0 - 255.0]."""
         return float(np.mean(gray_image))
 
 
