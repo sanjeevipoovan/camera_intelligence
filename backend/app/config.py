@@ -2,8 +2,7 @@
 Application Configuration Module.
 
 Centralized configuration using Pydantic Settings v2.
-Validates environment settings, resource boundaries, security policies,
-and model runtime parameters before startup.
+Supports vLLM (production deployment) and Ollama (local development).
 """
 
 from enum import StrEnum
@@ -26,6 +25,12 @@ class AppEnvironment(StrEnum):
     DEVELOPMENT = "development"
     TESTING = "testing"
     PRODUCTION = "production"
+
+
+class InferenceBackend(StrEnum):
+    VLLM = "vllm"          # Production High-Throughput Engine
+    OLLAMA = "ollama"      # Local Workstation Engine
+    SIMULATED = "simulated"# CI/CD & Unit Tests
 
 
 class ModelDevice(StrEnum):
@@ -66,10 +71,7 @@ class LogFormat(StrEnum):
 
 
 class Settings(BaseSettings):
-    """
-    Central settings schema enforcing strict boundaries and security guarantees.
-    Loads from host environment variables, falling back to an optional .env file.
-    """
+    """Central settings schema enforcing strict boundaries and security guarantees."""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -87,24 +89,62 @@ class Settings(BaseSettings):
     API_DESCRIPTION: str = Field(default="Mobile visual intelligence inference backend")
     VERSION: str = Field(default="1.0.0")
 
-    # B. Model Configuration
-    MODEL_NAME: str = Field(default="LiquidAI/LFM3-Omni-2B")
+    # B. Model & Inference Backend Configuration
+    INFERENCE_BACKEND: InferenceBackend = Field(
+        default=InferenceBackend.OLLAMA,
+        description="Active backend runtime: 'vllm' for cloud deployment, 'ollama' for local dev",
+    )
+    MODEL_NAME: str = Field(default="lfm3-omni:latest")
+    
+    # vLLM Server Settings (OpenAI-compatible VLM endpoint)
+    VLLM_BASE_URL: str = Field(
+        default="http://localhost:8000/v1",
+        description="Endpoint of the deployed vLLM engine",
+    )
+    VLLM_API_KEY: SecretStr | None = Field(
+        default=None,
+        description="Bearer token for protected vLLM deployments",
+    )
+
+    # Ollama Settings (Local fallback)
+    OLLAMA_BASE_URL: str = Field(default="http://localhost:11434")
+
     MODEL_DEVICE: ModelDevice = Field(default=ModelDevice.AUTO)
     MODEL_DTYPE: ModelDType = Field(default=ModelDType.AUTO)
-    MODEL_TIMEOUT: PositiveFloat = Field(default=30.0)
+    MODEL_TIMEOUT: PositiveFloat = Field(default=60.0)
     MODEL_MAX_NEW_TOKENS: Annotated[int, Field(ge=1, le=4096)] = Field(default=512)
     MODEL_TEMPERATURE: Annotated[float, Field(ge=0.0, le=2.0)] = Field(default=0.7)
     MODEL_TOP_P: Annotated[float, Field(gt=0.0, le=1.0)] = Field(default=0.9)
-    MODEL_TRUST_REMOTE_CODE: bool = Field(default=False)
-    MODEL_CACHE_DIR: Path | None = Field(default=None)
-    MODEL_LOAD_ON_STARTUP: bool = Field(default=False)
+    MODEL_TRUST_REMOTE_CODE: bool = Field(default=True)
+    MODEL_LOAD_ON_STARTUP: bool = Field(default=True)
+    # --------------------------------------------------------------------------
+    # KV Cache & Advanced Inference Optimization
+    # --------------------------------------------------------------------------
+    ENABLE_PREFIX_CACHING: bool = Field(
+        default=True,
+        description="Enable automatic KV cache reuse across multiple turns on the same image",
+    )
+    KV_CACHE_DTYPE: str = Field(
+        default="auto",
+        description="KV cache precision: 'auto', 'fp8', 'fp16'. fp8 saves 50% VRAM on supported GPUs",
+    )
+    ENABLE_CHUNKED_PREFILL: bool = Field(
+        default=True,
+        description="Interleave image prefill with token decode to prevent streaming stutter",
+    )
+    MAX_MODEL_LEN: PositiveInt = Field(
+        default=4096,
+        description="Maximum context window budget (tokens) including visual tokens",
+    )
+    MAX_NUM_SEQS: PositiveInt = Field(
+        default=16,
+        description="Maximum concurrent sequences handled by PagedAttention",
+    )
 
-    # C. GPU and Inference Resource Configuration
-    MAX_CONCURRENT_INFERENCES: PositiveInt = Field(default=2)
+    # C. Concurrency Configuration
+    MAX_CONCURRENT_INFERENCES: PositiveInt = Field(default=4)
     INFERENCE_QUEUE_ENABLED: bool = Field(default=True)
-    INFERENCE_QUEUE_TIMEOUT: PositiveFloat = Field(default=15.0)
-    GPU_MEMORY_FRACTION: Annotated[float, Field(gt=0.0, le=1.0)] | None = Field(default=0.85)
-    INFERENCE_WORKERS: PositiveInt = Field(default=1)
+    INFERENCE_QUEUE_TIMEOUT: PositiveFloat = Field(default=20.0)
 
     # D. Image Upload Configuration
     MAX_IMAGE_SIZE_MB: PositiveFloat = Field(default=10.0)
@@ -152,21 +192,19 @@ class Settings(BaseSettings):
     API_KEY_AUTH_ENABLED: bool = Field(default=False)
     API_SECRET_KEY: SecretStr | None = Field(default=None)
 
-    # I. Storage and Privacy Configuration
+    # I. Privacy & Logging
     STORE_IMAGES: bool = Field(default=False)
     TEMP_IMAGE_AUTO_DELETE: bool = Field(default=True)
     TEMP_IMAGE_RETENTION_SECONDS: PositiveInt = Field(default=60)
     LOG_IMAGE_CONTENT: bool = Field(default=False)
     STORE_REQUEST_METADATA: bool = Field(default=True)
-
-    # J. Logging and Monitoring Configuration
     LOG_LEVEL: LogLevel = Field(default=LogLevel.INFO)
     LOG_FORMAT: LogFormat = Field(default=LogFormat.CONSOLE)
     ENABLE_REQUEST_ID: bool = Field(default=True)
     ENABLE_PERFORMANCE_METRICS: bool = Field(default=True)
     ENABLE_MODEL_METRICS: bool = Field(default=True)
 
-    # K. Frontend Integration Configuration
+    # J. Frontend Integration
     FRONTEND_ORIGINS: list[str] = Field(
         default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"]
     )
@@ -208,9 +246,7 @@ class Settings(BaseSettings):
         valid_mime_types = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
         for fmt in formats:
             if fmt not in valid_mime_types:
-                raise ValueError(
-                    f"Unsupported format '{fmt}'. Only {sorted(valid_mime_types)} are supported."
-                )
+                raise ValueError(f"Unsupported format '{fmt}'.")
         return formats
 
     @model_validator(mode="after")
@@ -233,15 +269,6 @@ class Settings(BaseSettings):
             and self.MODERATION_FAIL_POLICY != ModerationFailPolicy.FAIL_CLOSED
         ):
             raise ValueError("MODERATION_FAIL_POLICY must be 'fail_closed' in production.")
-
-        calculated_max_pixels = self.MAX_IMAGE_WIDTH * self.MAX_IMAGE_HEIGHT
-        if self.MAX_IMAGE_PIXELS < calculated_max_pixels:
-            raise ValueError("MAX_IMAGE_PIXELS cannot be less than MAX_IMAGE_WIDTH * MAX_IMAGE_HEIGHT.")
-
-        if self.IMAGE_MIN_WIDTH >= self.MAX_IMAGE_WIDTH:
-            raise ValueError("IMAGE_MIN_WIDTH must be strictly less than MAX_IMAGE_WIDTH.")
-        if self.IMAGE_MIN_HEIGHT >= self.MAX_IMAGE_HEIGHT:
-            raise ValueError("IMAGE_MIN_HEIGHT must be strictly less than MAX_IMAGE_HEIGHT.")
 
         if self.LOG_IMAGE_CONTENT:
             raise ValueError("LOG_IMAGE_CONTENT cannot be set to True.")
