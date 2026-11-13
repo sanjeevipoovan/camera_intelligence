@@ -1,14 +1,14 @@
 """
 FastAPI Application Entry Point.
 
-Integrates CORS middleware, custom exception handlers, lifespan events,
-and the API v1 routing tree.
+Integrates dynamic local-network CORS middleware, custom exception handlers,
+lifespan events, and the API v1 routing tree.
 """
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 import logging
-
+from app.moderation.service import moderation_service
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -32,11 +32,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app_settings.VERSION,
     )
 
-    # Initialize model weights on startup if configured
     if app_settings.MODEL_LOAD_ON_STARTUP:
         logger.info("MODEL_LOAD_ON_STARTUP is enabled. Preloading %s...", app_settings.MODEL_NAME)
         engine.load_model()
-
+    for provider in moderation_service.providers:
+        if hasattr(provider, "load_model"):
+            provider.load_model()
     yield
 
     logger.info("Application shutdown completed.")
@@ -56,13 +57,23 @@ def create_application() -> FastAPI:
     )
 
     # Cross-Origin Resource Sharing (CORS)
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=app_settings.CORS_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["*"],
-    )
+    # In development: automatically allows localhost and any Wi-Fi IP (192.168.x.x, 10.x.x.x)
+    if app_settings.APP_ENV == AppEnvironment.DEVELOPMENT:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origin_regex=r"^https?://.*",
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+    else:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=app_settings.CORS_ORIGINS,
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["*"],
+        )
 
     # Global Exception Handlers
     register_exception_handlers(app)
